@@ -1,0 +1,241 @@
+# channel - two-party payment channels: fund once, transact off-chain as
+# many times as you like, settle once.
+#
+#   import "channel" as channel
+#
+#   let b = channel.new_board()
+#   channel.fund(b, "alice", 500.00)              # top up a party
+#   channel.balance(b, "alice")                   # -> 500.00
+#   let r = channel.open(b, "alice", "bob", 500.00, 300.00, "sa", "sb", 5)
+#   channel.get(b, r["id"])                       # the channel record
+#
+#   off-chain, as often as you like:
+#   channel.state_message(id, 1, 480.00, 320.00)  # what gets signed
+#   channel.sign_state(id, 1, 480.00, 320.00, "sa")
+#   channel.update(b, id, 1, 480.00, 320.00, sig_a, sig_b)
+#
+#   on-chain, once:
+#   channel.close_cooperative(b, id, 1, 480.00, 320.00, sig_a, sig_b)
+#   channel.close_unilateral(b, id, "alice", 1, 480.00, 320.00, sa, sb, now)
+#   channel.dispute(b, id, 2, 460.00, 340.00, sa, sb)   # a newer state wins
+#   channel.settle(b, id, now)                          # after the window
+#
+#   channel.save(b, "channels.json")
+#   channel.load("channels.json")
+#
+# WHAT IS DIFFERENT ABOUT THIS ONE
+#
+# Every other escrow project in this series gates a single transaction on
+# an amount: is there enough, is the pool solvent, do the two halves of a
+# split reconcile. The gate here is ORDERING. Two states can both be
+# perfectly valid - correct arithmetic, correct signatures from both
+# parties - and the only thing that decides which one is true is a
+# sequence number. Nothing else in this series has that shape.
+#
+# That is what makes a channel work. The parties exchange hundreds of
+# signed states privately and only the last one ever touches the escrow,
+# so N transactions cost one settlement. And it is what makes a channel
+# dangerous: an old state is still a validly signed state, so the protocol
+# has to make submitting one worse than not.
+#
+# THE FOUR REQUIRES, none of them a tautology:
+#   1. every update conserves the total, to the cent
+#   2. a superseding state must have a STRICTLY higher nonce
+#   3. both parties must have signed the state being submitted
+#   4. settlement drains the escrow to exactly $0.00
+
+import "vendor/json.lz" as json
+import "vendor/crypto.lz" as crypto
+import "vendor/escrow.lz" as escrow
+import "vendor/uuid.lz" as uuid
+import "moneyx.lz" as moneyx
+
+fn new_board() { return {"wallets": {}, "channels": {}} }
+
+fn balance(board, name) {
+  return board["wallets"].has(name) ? board["wallets"][name] : 0.0
+}
+
+fn _set_balance(board, name, f) { board["wallets"][name] = round(f, 2) }
+
+fn fund(board, name, amount) {
+  _set_balance(board, name, balance(board, name) + amount)
+  return balance(board, name)
+}
+
+# The message both parties sign. Channel id is in it so a state from one
+# channel cannot be replayed into another.
+fn state_message(id, nonce, bal_a, bal_b) {
+  return id + "|" + str(nonce) + "|" + str(round(bal_a, 2)) + "|" + str(round(bal_b, 2))
+}
+
+fn sign_state(id, nonce, bal_a, bal_b, secret) {
+  return crypto.hmac(secret, state_message(id, nonce, bal_a, bal_b))
+}
+
+fn _verify(ch, nonce, bal_a, bal_b, sig_a, sig_b) {
+  let msg_a = sign_state(ch["id"], nonce, bal_a, bal_b, ch["secret_a"])
+  let msg_b = sign_state(ch["id"], nonce, bal_a, bal_b, ch["secret_b"])
+  if msg_a != sig_a { return "signature from " + ch["party_a"] + " does not verify" }
+  if msg_b != sig_b { return "signature from " + ch["party_b"] + " does not verify" }
+  return nil
+}
+
+fn open(board, party_a, party_b, amount_a, amount_b, secret_a, secret_b, window) {
+  if balance(board, party_a) < amount_a { return {"ok": false, "error": party_a + " cannot fund " + str(amount_a)} }
+  if balance(board, party_b) < amount_b { return {"ok": false, "error": party_b + " cannot fund " + str(amount_b)} }
+
+  # real money leaves both parties and sits in one holding wallet
+  wallet wa = moneyx.of(balance(board, party_a))
+  wallet wb = moneyx.of(balance(board, party_b))
+  wallet holding
+  try {
+    escrow.open(moneyx.of(amount_a), wa, holding)
+    escrow.open(moneyx.of(amount_b), wb, holding)
+  } catch e {
+    return {"ok": false, "error": e["message"]}
+  }
+  _set_balance(board, party_a, moneyx.to_float(wa.balance))
+  _set_balance(board, party_b, moneyx.to_float(wb.balance))
+
+  let id = uuid.v4()
+  board["channels"][id] = {
+    "id": id,
+    "party_a": party_a,
+    "party_b": party_b,
+    "secret_a": secret_a,
+    "secret_b": secret_b,
+    "total": round(amount_a + amount_b, 2),
+    "escrow": round(amount_a + amount_b, 2),
+    "nonce": 0,
+    "bal_a": round(amount_a, 2),
+    "bal_b": round(amount_b, 2),
+    "updates": 0,
+    "state": "open",
+    "window": window,
+    "closing_at": 0,
+    "closed_by": "",
+    "penalised": ""
+  }
+  return {"ok": true, "id": id, "total": round(amount_a + amount_b, 2)}
+}
+
+fn get(board, id) {
+  return board["channels"].has(id) ? board["channels"][id] : nil
+}
+
+# An off-chain update. Nothing moves; the state is simply accepted as the
+# newest one both parties have signed.
+fn update(board, id, nonce, bal_a, bal_b, sig_a, sig_b) {
+  let ch = get(board, id)
+  if ch == nil { return {"ok": false, "error": "no such channel"} }
+  if ch["state"] != "open" { return {"ok": false, "error": "channel is " + ch["state"]} }
+
+  # REQUIRE 1: conservation, to the cent
+  if round(bal_a + bal_b, 2) != ch["total"] {
+    return {"ok": false, "error": "balances sum to " + str(round(bal_a + bal_b, 2)) + ", channel total is " + str(ch["total"])}
+  }
+  # REQUIRE 2: strictly newer
+  if nonce <= ch["nonce"] {
+    return {"ok": false, "error": "nonce " + str(nonce) + " is not newer than " + str(ch["nonce"])}
+  }
+  # REQUIRE 3: both signatures
+  let bad = _verify(ch, nonce, bal_a, bal_b, sig_a, sig_b)
+  if bad != nil { return {"ok": false, "error": bad} }
+
+  ch["nonce"] = nonce
+  ch["bal_a"] = round(bal_a, 2)
+  ch["bal_b"] = round(bal_b, 2)
+  ch["updates"] = ch["updates"] + 1
+  return {"ok": true, "nonce": nonce}
+}
+
+fn _payout(board, ch, to_a, to_b) {
+  wallet holding = moneyx.of(ch["escrow"])
+  wallet wa = moneyx.of(balance(board, ch["party_a"]))
+  wallet wb = moneyx.of(balance(board, ch["party_b"]))
+  if to_a > 0.0 { pay moneyx.of(to_a) from holding to wa }
+  if to_b > 0.0 { pay moneyx.of(to_b) from holding to wb }
+  # REQUIRE 4: the holding wallet must land on exactly zero
+  require moneyx.to_float(holding.balance) == 0.0, "escrow did not drain to zero"
+  _set_balance(board, ch["party_a"], moneyx.to_float(wa.balance))
+  _set_balance(board, ch["party_b"], moneyx.to_float(wb.balance))
+  ch["escrow"] = 0.0
+  ch["state"] = "settled"
+}
+
+# Both parties sign the same final state: settle immediately, no window.
+fn close_cooperative(board, id, nonce, bal_a, bal_b, sig_a, sig_b) {
+  let ch = get(board, id)
+  if ch == nil { return {"ok": false, "error": "no such channel"} }
+  if ch["state"] != "open" { return {"ok": false, "error": "channel is " + ch["state"]} }
+  if round(bal_a + bal_b, 2) != ch["total"] {
+    return {"ok": false, "error": "balances do not conserve the total"}
+  }
+  let bad = _verify(ch, nonce, bal_a, bal_b, sig_a, sig_b)
+  if bad != nil { return {"ok": false, "error": bad} }
+
+  _payout(board, ch, bal_a, bal_b)
+  return {"ok": true, "to_a": round(bal_a, 2), "to_b": round(bal_b, 2), "updates": ch["updates"]}
+}
+
+# One party submits a state and starts the dispute window.
+fn close_unilateral(board, id, by, nonce, bal_a, bal_b, sig_a, sig_b, now) {
+  let ch = get(board, id)
+  if ch == nil { return {"ok": false, "error": "no such channel"} }
+  if ch["state"] != "open" { return {"ok": false, "error": "channel is " + ch["state"]} }
+  if by != ch["party_a"] and by != ch["party_b"] { return {"ok": false, "error": by + " is not a party"} }
+  if round(bal_a + bal_b, 2) != ch["total"] { return {"ok": false, "error": "balances do not conserve the total"} }
+  let bad = _verify(ch, nonce, bal_a, bal_b, sig_a, sig_b)
+  if bad != nil { return {"ok": false, "error": bad} }
+
+  ch["state"] = "closing"
+  ch["closed_by"] = by
+  ch["nonce"] = nonce
+  ch["bal_a"] = round(bal_a, 2)
+  ch["bal_b"] = round(bal_b, 2)
+  ch["closing_at"] = now
+  return {"ok": true, "nonce": nonce, "settles_after": now + ch["window"]}
+}
+
+# The counterparty answers with a strictly newer signed state. The party
+# who submitted the stale one forfeits their whole balance.
+fn dispute(board, id, nonce, bal_a, bal_b, sig_a, sig_b) {
+  let ch = get(board, id)
+  if ch == nil { return {"ok": false, "error": "no such channel"} }
+  if ch["state"] != "closing" { return {"ok": false, "error": "channel is not closing"} }
+  if round(bal_a + bal_b, 2) != ch["total"] { return {"ok": false, "error": "balances do not conserve the total"} }
+  # REQUIRE 2 again, and this is the whole security model
+  if nonce <= ch["nonce"] {
+    return {"ok": false, "error": "nonce " + str(nonce) + " does not beat the submitted " + str(ch["nonce"])}
+  }
+  let bad = _verify(ch, nonce, bal_a, bal_b, sig_a, sig_b)
+  if bad != nil { return {"ok": false, "error": bad} }
+
+  ch["nonce"] = nonce
+  ch["bal_a"] = round(bal_a, 2)
+  ch["bal_b"] = round(bal_b, 2)
+  ch["penalised"] = ch["closed_by"]
+  return {"ok": true, "nonce": nonce, "penalised": ch["closed_by"]}
+}
+
+fn settle(board, id, now) {
+  let ch = get(board, id)
+  if ch == nil { return {"ok": false, "error": "no such channel"} }
+  if ch["state"] != "closing" { return {"ok": false, "error": "channel is " + ch["state"]} }
+  if now < ch["closing_at"] + ch["window"] {
+    return {"ok": false, "error": "dispute window closes at " + str(ch["closing_at"] + ch["window"])}
+  }
+
+  let to_a = ch["bal_a"]
+  let to_b = ch["bal_b"]
+  if ch["penalised"] == ch["party_a"] { to_b = ch["total"]  to_a = 0.0 }
+  if ch["penalised"] == ch["party_b"] { to_a = ch["total"]  to_b = 0.0 }
+
+  _payout(board, ch, to_a, to_b)
+  return {"ok": true, "to_a": round(to_a, 2), "to_b": round(to_b, 2),
+          "penalised": ch["penalised"], "updates": ch["updates"]}
+}
+
+fn save(board, path) { write_file(path, json.stringify(board)) }
+fn load(path) { return file_exists(path) ? json.parse(read_file(path)) : new_board() }

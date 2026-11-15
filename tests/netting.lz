@@ -1,0 +1,42 @@
+import "../lib/channel.lz" as channel
+
+# N off-chain updates cost exactly one settlement. 25 rather than 500,
+# because each update costs four HMAC-SHA256 computations and crypto.lz is
+# pure Larzscript - measured at 0.45s per HMAC on this machine, so 500
+# updates would be a quarter of an hour of signing. The ratio is the claim,
+# not the absolute number; see the README on what that rate means.
+let UPDATES = 25
+
+fn main() {
+  let b = channel.new_board()
+  channel.fund(b, "alice", 500.00)
+  channel.fund(b, "bob", 300.00)
+  let r = channel.open(b, "alice", "bob", 500.00, 300.00, "sa", "sb", 0)
+  let id = r["id"]
+
+  let n = 1
+  while n <= UPDATES {
+    let ba = round(500.00 - n * 0.01, 2)
+    let bb = round(300.00 + n * 0.01, 2)
+    let sa = channel.sign_state(id, n, ba, bb, "sa")
+    let sb = channel.sign_state(id, n, ba, bb, "sb")
+    let u = channel.update(b, id, n, ba, bb, sa, sb)
+    if not u["ok"] { print("update " + str(n) + " failed: " + u["error"])  return 1 }
+    n = n + 1
+  }
+
+  let ch = channel.get(b, id)
+  print("off-chain updates: " + str(ch["updates"]))
+  print("final state: alice $" + str(ch["bal_a"]) + " / bob $" + str(ch["bal_b"]))
+
+  let sa = channel.sign_state(id, UPDATES, ch["bal_a"], ch["bal_b"], "sa")
+  let sb = channel.sign_state(id, UPDATES, ch["bal_a"], ch["bal_b"], "sb")
+  let c = channel.close_cooperative(b, id, UPDATES, ch["bal_a"], ch["bal_b"], sa, sb)
+  if not c["ok"] { print("close failed: " + c["error"])  return 1 }
+
+  print("settlements: 1")
+  print("alice $" + str(round(channel.balance(b, "alice"), 2)) + "  bob $" + str(round(channel.balance(b, "bob"), 2)))
+  print("total conserved: $" + str(round(channel.balance(b, "alice") + channel.balance(b, "bob"), 2)))
+  return 0
+}
+main()

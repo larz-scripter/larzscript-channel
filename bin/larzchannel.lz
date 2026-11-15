@@ -1,0 +1,174 @@
+# larzchannel - two-party payment channels on the command line.
+#
+#   fund <party> <amount>
+#   open <a> <b> <amt_a> <amt_b> [--window SECONDS]
+#   sign <id> <nonce> <bal_a> <bal_b> a|b
+#   update <id> <nonce> <bal_a> <bal_b> <sig_a> <sig_b>
+#   close <id> <nonce> <bal_a> <bal_b> <sig_a> <sig_b>
+#   unilateral <id> <by> <nonce> <bal_a> <bal_b> <sig_a> <sig_b>
+#   dispute <id> <nonce> <bal_a> <bal_b> <sig_a> <sig_b>
+#   settle <id>
+#   show [id]
+#
+# State lives in a JSON file (--file, default channels.json) because each
+# CLI run is a fresh process.
+
+import "../lib/channel.lz" as channel
+
+fn opt(name, fallback) {
+  let i = 0
+  while i < len(args) {
+    if args[i] == name and i + 1 < len(args) { return args[i + 1] }
+    i = i + 1
+  }
+  return fallback
+}
+
+fn positional() {
+  let out = []
+  let i = 0
+  let seen_cmd = false
+  while i < len(args) {
+    if args[i].starts_with("--") { i = i + 2  continue }
+    if not seen_cmd { seen_cmd = true  i = i + 1  continue }
+    out.push(args[i])
+    i = i + 1
+  }
+  return out
+}
+
+fn fail(msg) { print("error: " + msg)  exit(1) }
+
+# Short-id lookup with the 4-character guard every project in this series
+# uses: "".starts_with("") is always true, so an empty prefix would match
+# whichever channel happened to be iterated first.
+fn find_id(board, prefix) {
+  if len(prefix) < 4 { return nil }
+  for id in board["channels"].keys() {
+    if id.starts_with(prefix) { return id }
+  }
+  return nil
+}
+
+fn short(id) { return id[0:8] }
+
+fn main() {
+  if len(args) == 0 { print("usage: larzchannel <command> - see the header of this file")  return 2 }
+  # The command is the first argument that is not a flag, so `--file x open
+  # ...` and `open ... --file x` both work. Assuming args[0] made the former
+  # report `unknown command: --file`.
+  let cmd = ""
+  let ci = 0
+  while ci < len(args) {
+    if not args[ci].starts_with("--") { cmd = args[ci]  break }
+    ci = ci + 2
+  }
+  if cmd == "" { print("no command given")  return 2 }
+  let path = opt("--file", "channels.json")
+  let board = channel.load(path)
+  let p = positional()
+  let now = int(opt("--now", str(time())))
+
+  if cmd == "fund" {
+    if len(p) < 2 { fail("fund <party> <amount>") }
+    let b = channel.fund(board, p[0], float(p[1]))
+    channel.save(board, path)
+    print(p[0] + " balance $" + str(round(b, 2)))
+    return 0
+  }
+
+  if cmd == "open" {
+    if len(p) < 4 { fail("open <a> <b> <amt_a> <amt_b>") }
+    let window = int(opt("--window", "5"))
+    let r = channel.open(board, p[0], p[1], float(p[2]), float(p[3]),
+                         "secret-" + p[0], "secret-" + p[1], window)
+    if not r["ok"] { fail(r["error"]) }
+    channel.save(board, path)
+    print("channel " + short(r["id"]) + " open, total $" + str(r["total"]) +
+          ", dispute window " + str(window) + "s")
+    return 0
+  }
+
+  if cmd == "sign" {
+    if len(p) < 5 { fail("sign <id> <nonce> <bal_a> <bal_b> a|b") }
+    let id = find_id(board, p[0])
+    if id == nil { fail("no channel matching " + p[0]) }
+    let ch = channel.get(board, id)
+    let secret = p[4] == "a" ? ch["secret_a"] : ch["secret_b"]
+    print(channel.sign_state(id, int(p[1]), float(p[2]), float(p[3]), secret))
+    return 0
+  }
+
+  if cmd == "show" {
+    if len(p) > 0 {
+      let id = find_id(board, p[0])
+      if id == nil { fail("no channel matching " + p[0]) }
+      let ch = channel.get(board, id)
+      print("channel " + short(id) + "  " + ch["state"])
+      print("  " + ch["party_a"] + ": $" + str(ch["bal_a"]) + "   " + ch["party_b"] + ": $" + str(ch["bal_b"]))
+      print("  total $" + str(ch["total"]) + "  nonce " + str(ch["nonce"]) + "  updates " + str(ch["updates"]))
+      if ch["penalised"] != "" { print("  penalised: " + ch["penalised"]) }
+      return 0
+    }
+    let names = board["wallets"].keys()
+    names.sort()
+    for n in names { print(n + ": $" + str(round(channel.balance(board, n), 2))) }
+    for id in board["channels"].keys() {
+      let ch = channel.get(board, id)
+      print("channel " + short(id) + "  " + ch["state"] + "  nonce " + str(ch["nonce"]))
+    }
+    return 0
+  }
+
+  # everything below takes <id> <nonce> <bal_a> <bal_b> <sig_a> <sig_b>
+  if cmd == "update" or cmd == "close" or cmd == "dispute" {
+    if len(p) < 6 { fail(cmd + " <id> <nonce> <bal_a> <bal_b> <sig_a> <sig_b>") }
+    let id = find_id(board, p[0])
+    if id == nil { fail("no channel matching " + p[0]) }
+    let nonce = int(p[1])
+    let ba = float(p[2])
+    let bb = float(p[3])
+    let r = nil
+    if cmd == "update" { r = channel.update(board, id, nonce, ba, bb, p[4], p[5]) }
+    if cmd == "close" { r = channel.close_cooperative(board, id, nonce, ba, bb, p[4], p[5]) }
+    if cmd == "dispute" { r = channel.dispute(board, id, nonce, ba, bb, p[4], p[5]) }
+    if not r["ok"] { fail(r["error"]) }
+    channel.save(board, path)
+    if cmd == "update" { print("accepted nonce " + str(nonce)) }
+    if cmd == "close" {
+      print("settled cooperatively after " + str(r["updates"]) + " off-chain update(s)")
+      print("  paid $" + str(r["to_a"]) + " and $" + str(r["to_b"]))
+    }
+    if cmd == "dispute" { print("superseded with nonce " + str(nonce) + "; " + r["penalised"] + " forfeits") }
+    return 0
+  }
+
+  if cmd == "unilateral" {
+    if len(p) < 7 { fail("unilateral <id> <by> <nonce> <bal_a> <bal_b> <sig_a> <sig_b>") }
+    let id = find_id(board, p[0])
+    if id == nil { fail("no channel matching " + p[0]) }
+    let r = channel.close_unilateral(board, id, p[1], int(p[2]), float(p[3]), float(p[4]), p[5], p[6], now)
+    if not r["ok"] { fail(r["error"]) }
+    channel.save(board, path)
+    print(p[1] + " submitted nonce " + str(r["nonce"]) + "; settles after " + str(r["settles_after"]))
+    return 0
+  }
+
+  if cmd == "settle" {
+    if len(p) < 1 { fail("settle <id>") }
+    let id = find_id(board, p[0])
+    if id == nil { fail("no channel matching " + p[0]) }
+    let r = channel.settle(board, id, now)
+    if not r["ok"] { fail(r["error"]) }
+    channel.save(board, path)
+    print("settled after " + str(r["updates"]) + " off-chain update(s)")
+    print("  paid $" + str(r["to_a"]) + " and $" + str(r["to_b"]))
+    if r["penalised"] != "" { print("  " + r["penalised"] + " forfeited the channel for submitting a stale state") }
+    return 0
+  }
+
+  print("unknown command: " + cmd)
+  return 2
+}
+
+exit(main())

@@ -1,0 +1,14 @@
+latest signed state is nonce 5: alice 250 / bob 550
+--- alice submits nonce 2 instead (alice 400 / bob 400)
+alice submitted nonce 2; settles after 1002
+--- settling early is refused
+error: dispute window closes at 1002
+--- bob disputes
+superseded with nonce 5; alice forfeits
+--- settle
+settled after 5 off-chain update(s)
+  paid $0 and $800
+  alice forfeited the channel for submitting a stale state
+alice: $0
+bob: $800
+channel xxxxxxxx  settled  nonce 5

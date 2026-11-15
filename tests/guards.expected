@@ -1,0 +1,7 @@
+accepted nonce 1
+--- does not conserve the total
+error: balances sum to 600, channel total is 800
+--- not newer
+error: nonce 1 is not newer than 1
+--- forged signature
+error: signature from alice does not verify

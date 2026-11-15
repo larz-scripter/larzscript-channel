@@ -1,0 +1,12 @@
+alice balance $500
+bob balance $300
+channel xxxxxxxx open, total $800, dispute window 2s
+accepted nonce 1
+accepted nonce 2
+accepted nonce 3
+settled cooperatively after 3 off-chain update(s)
+  paid $440 and $360
+--- balances
+alice: $440
+bob: $360
+channel xxxxxxxx  settled  nonce 3

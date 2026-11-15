@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "entry": "_deps.lz",
+  "vendor_dir": "lib/vendor",
+  "packages": [
+    {"name": "crypto", "file": "crypto.lz", "sha256": "ec9a6128d13fa470a67acca8d7916947e5bf571e5a2880857cdb4864fbba0bde"},
+    {"name": "escrow", "file": "escrow.lz", "sha256": "cc72c9720fa7db1b177d4d53f9371e8b1f45fe83783cea60150471fdec1877ee"},
+    {"name": "json", "file": "json.lz", "sha256": "9782b3ede0505d92faf0879b55a421aa1f58b23af496cc4eb6380c38e1ade9b5"},
+    {"name": "random", "file": "random.lz", "sha256": "cf6bee211c21bf5b3d1501d3abc894df15bf1690ef549875266951053f58381a"},
+    {"name": "uuid", "file": "uuid.lz", "sha256": "19d648170286fd7cd5c584e99ffac8f1dce6b16c6a6bb328e7def094a9e69d21"}
+  ]
+}
